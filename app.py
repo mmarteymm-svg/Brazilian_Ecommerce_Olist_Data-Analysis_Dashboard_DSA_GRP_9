@@ -29,6 +29,36 @@ REQUIRED_TABLES = [
     "order_reviews", "products", "sellers", "product_category_name_translation",
 ]
 
+# Bundled dataset location: put the 8 Olist CSVs (everything except
+# olist_geolocation_dataset.csv, which the app doesn't use) in a `data/`
+# folder next to this script and they'll load automatically — no upload
+# needed. The sidebar uploader still works and overrides these for the
+# session if the user uploads files there instead.
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+BUNDLED_FILENAMES = [
+    "olist_customers_dataset.csv",
+    "olist_orders_dataset.csv",
+    "olist_order_items_dataset.csv",
+    "olist_order_payments_dataset.csv",
+    "olist_order_reviews_dataset.csv",
+    "olist_products_dataset.csv",
+    "olist_sellers_dataset.csv",
+    "product_category_name_translation.csv",
+]
+
+
+def get_bundled_file_records():
+    """Read whichever bundled CSVs exist in DATA_DIR. Returns a tuple of
+    (filename, bytes), matching the shape st.file_uploader results are
+    converted to, so both paths can feed the same load_data()."""
+    records = []
+    for filename in BUNDLED_FILENAMES:
+        path = os.path.join(DATA_DIR, filename)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                records.append((filename, f.read()))
+    return tuple(records)
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -177,16 +207,34 @@ def train_model(ml_data: pd.DataFrame, fingerprint):
 st.title("🛒 Olist E-Commerce Analytics")
 st.caption("Revenue, customers, delivery, and a late-delivery risk model — DSA Group 9 capstone.")
 
+bundled_records = get_bundled_file_records()
+
 with st.sidebar:
     st.header("Data")
-    st.caption("Upload the Olist CSVs (kaggle.com/datasets/olistbr/brazilian-ecommerce)")
-    uploaded = st.file_uploader("Select all 8 CSVs at once", type="csv", accept_multiple_files=True)
+    if bundled_records:
+        st.success(f"✅ {len(bundled_records)}/{len(BUNDLED_FILENAMES)} bundled CSVs found in `data/`")
+    else:
+        st.warning("No bundled CSVs found in `data/`")
+    st.caption(
+        "Optional: upload CSVs below to override the bundled data for this "
+        "session (e.g. to test a refreshed export). "
+        "Source: kaggle.com/datasets/olistbr/brazilian-ecommerce"
+    )
+    uploaded = st.file_uploader("Select CSVs to override bundled data", type="csv", accept_multiple_files=True)
 
-if not uploaded:
-    st.info("👈 Upload the Olist CSVs to get started.")
+if uploaded:
+    file_records = tuple((f.name, f.getvalue()) for f in uploaded)
+    st.caption("📤 Using uploaded files for this session (overriding bundled data).")
+elif bundled_records:
+    file_records = bundled_records
+    st.caption("📁 Using bundled data from the app's `data/` folder.")
+else:
+    file_records = ()
+
+if not file_records:
+    st.info("👈 No data available yet — upload the Olist CSVs to get started, or add them to the app's `data/` folder.")
     st.stop()
 
-file_records = tuple((f.name, f.getvalue()) for f in uploaded)
 con = load_data(file_records)
 
 table_names = con.sql("SHOW TABLES").df()["name"].tolist()
