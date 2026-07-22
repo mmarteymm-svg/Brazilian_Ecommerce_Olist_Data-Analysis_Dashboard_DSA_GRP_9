@@ -138,7 +138,20 @@ def train_model(ml_data: pd.DataFrame, fingerprint):
     X = ml_data.drop(columns="is_late")
     y = ml_data["is_late"]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    class_counts = y.value_counts()
+    if len(class_counts) < 2:
+        return {"error": "Only one delivery outcome (all late or all on-time) is present in this data — there's no variation for a model to learn from."}
+    if len(y) < 10:
+        return {"error": f"Only {len(y)} delivered orders with complete data were found — too few to train a reliable model."}
+
+    # Stratified split needs at least 2 members per class; fall back to a plain
+    # split if the minority class is too small for that.
+    can_stratify = class_counts.min() >= 2
+    strat = y if can_stratify else None
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=strat
+    )
     scaler = StandardScaler()
     X_train_s, X_test_s = scaler.fit_transform(X_train), scaler.transform(X_test)
 
@@ -151,7 +164,7 @@ def train_model(ml_data: pd.DataFrame, fingerprint):
     return {
         "model": model, "scaler": scaler, "features": list(X.columns),
         "accuracy": accuracy_score(y_test, preds),
-        "recall_late": recall_score(y_test, preds),
+        "recall_late": recall_score(y_test, preds, zero_division=0),
         "baseline_accuracy": accuracy_score(y_test, baseline.predict(X_test)),
         "late_rate": y.mean(),
     }
@@ -190,11 +203,12 @@ model = train_model(ml_data, fingerprint)
 total_revenue = monthly_revenue["revenue"].sum()
 total_orders = con.sql("SELECT COUNT(DISTINCT order_id) n FROM orders").df()["n"][0]
 avg_review = con.sql("SELECT AVG(review_score) a FROM order_reviews").df()["a"][0]
+late_rate_display = f"{model['late_rate']:.1%}" if "error" not in model else "N/A"
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total Revenue", f"R$ {total_revenue:,.0f}")
 c2.metric("Total Orders", f"{total_orders:,}")
-c3.metric("Late Delivery Rate", f"{model['late_rate']:.1%}")
+c3.metric("Late Delivery Rate", late_rate_display)
 c4.metric("Avg Review Score", f"{avg_review:.2f} / 5")
 
 st.divider()
@@ -227,30 +241,45 @@ st.divider()
 
 # --- Model ---
 st.subheader("🤖 Late-Delivery Risk Model")
-mcol1, mcol2, mcol3 = st.columns(3)
-mcol1.metric("Baseline Accuracy", f"{model['baseline_accuracy']:.1%}")
-mcol2.metric("Model Accuracy", f"{model['accuracy']:.1%}")
-mcol3.metric("Model Recall (late orders)", f"{model['recall_late']:.1%}")
-st.caption(
-    "The baseline model (always predicts 'on time') gets high accuracy but 0% recall on late orders — "
-    "it's useless as a risk flag. The balanced logistic regression trades some accuracy for much better "
-    "recall, catching far more of the orders that are actually late."
-)
+if "error" in model:
+    st.warning(f"Model not trained: {model['error']}")
+else:
+    mcol1, mcol2, mcol3 = st.columns(3)
+    mcol1.metric("Baseline Accuracy", f"{model['baseline_accuracy']:.1%}")
+    mcol2.metric("Model Accuracy", f"{model['accuracy']:.1%}")
+    mcol3.metric("Model Recall (late orders)", f"{model['recall_late']:.1%}")
+    st.caption(
+        "The baseline model (always predicts 'on time') gets high accuracy but 0% recall on late orders — "
+        "it's useless as a risk flag. The balanced logistic regression trades some accuracy for much better "
+        "recall, catching far more of the orders that are actually late."
+    )
 
 st.divider()
 
 # --- Summary ---
 st.subheader("📋 Recommendation")
+tier1_avg = quartile_summary.groupby('quartile')['total_spent'].mean().iloc[0]
+
+if "error" in model:
+    model_summary = (
+        "A late-delivery risk model could not be trained on this data "
+        f"({model['error'].lower()}). Try uploading the full dataset for a complete picture."
+    )
+else:
+    model_summary = (
+        f"On delivery: **{model['late_rate']:.1%}** of orders arrive late. A plain accuracy-optimized model "
+        f"looks good on paper ({model['baseline_accuracy']:.1%} accuracy) but catches essentially no late "
+        f"orders. The class-balanced model catches **{model['recall_late']:.1%}** of them instead, at the "
+        "cost of some accuracy — the right trade-off for a checkout-time risk flag, since missing a late "
+        "order is costlier than a false alarm."
+    )
+
 st.markdown(f"""
 Total revenue across the uploaded data is **R$ {total_revenue:,.0f}** across **{total_orders:,} orders**.
 Customer spend is concentrated at the top: Tier 1 customers (top 25% by spend) average
-**R$ {quartile_summary.groupby('quartile')['total_spent'].mean().iloc[0]:,.2f}** each — a strong case for a
-targeted retention program for that segment.
+**R$ {tier1_avg:,.2f}** each — a strong case for a targeted retention program for that segment.
 
-On delivery: **{model['late_rate']:.1%}** of orders arrive late. A plain accuracy-optimized model looks good
-on paper ({model['baseline_accuracy']:.1%} accuracy) but catches essentially no late orders. The
-class-balanced model catches **{model['recall_late']:.1%}** of them instead, at the cost of some accuracy —
-the right trade-off for a checkout-time risk flag, since missing a late order is costlier than a false alarm.
+{model_summary}
 
 **Recommended actions:** (1) launch a Tier-1 retention offer, (2) deploy the balanced model as a live
 risk flag rather than the accuracy-optimized one, (3) review fulfillment for the highest-revenue categories.
