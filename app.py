@@ -69,21 +69,46 @@ def find_bundled_csvs() -> dict:
 
 
 def load_table(con: duckdb.DuckDBPyConnection, name: str, path: str) -> None:
-    """Load one CSV into DuckDB as table `name`. Uses pandas with explicit
-    parse_dates for tables with known date columns (reliable), and DuckDB's
-    read_csv_auto for everything else (fast, fine for non-date columns)."""
+    """Load one CSV into DuckDB as table `name`.
+
+    For tables with known date columns, reads with pandas and explicitly
+    converts those columns with pd.to_datetime(..., format="mixed",
+    errors="coerce"). We do NOT rely on read_csv's parse_dates= — if even one
+    row has a differently-formatted date (e.g. "2017/10/04" mixed in with
+    "2017-10-02"), pandas silently leaves the WHOLE column as plain text with
+    no error or warning. Explicit post-hoc to_datetime with format="mixed"
+    parses each value independently and is far more robust to messy real data.
+
+    As a final safety net, after loading we verify every date column actually
+    ended up as TIMESTAMP in DuckDB, and force-cast with TRY_CAST if not —
+    so a date-parsing quirk can degrade (some NULLs) but can never crash the
+    app with a BinderException again.
+    """
     date_cols = DATE_COLUMNS.get(name, [])
     if date_cols:
-        # Only parse columns that actually exist in this file, in case of
-        # a slightly different export/schema version.
-        header = pd.read_csv(path, nrows=0).columns.tolist()
-        parse_dates = [c for c in date_cols if c in header]
-        df = pd.read_csv(path, parse_dates=parse_dates) if parse_dates else pd.read_csv(path)
+        df = pd.read_csv(path)
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce", format="mixed")
         con.register("_stage", df)
         con.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _stage')
         con.unregister("_stage")
     else:
         con.execute(f"CREATE OR REPLACE TABLE \"{name}\" AS SELECT * FROM read_csv_auto('{path}')")
+
+    # Safety net: force any remaining date/timestamp-named column that isn't
+    # actually TIMESTAMP/DATE typed in DuckDB to be cast, so downstream SQL
+    # (date_trunc, comparisons, DATE_DIFF) can never hit a type error.
+    cols = con.execute(f'DESCRIBE "{name}"').df()
+    for _, row in cols.iterrows():
+        col, dtype = row["column_name"], row["column_type"]
+        looks_like_date = "date" in col.lower() or "timestamp" in col.lower()
+        already_typed = dtype in ("TIMESTAMP", "DATE", "TIMESTAMP WITH TIME ZONE")
+        if looks_like_date and not already_typed:
+            con.execute(
+                f'ALTER TABLE "{name}" ALTER COLUMN "{col}" '
+                f'TYPE TIMESTAMP USING TRY_CAST("{col}" AS TIMESTAMP)'
+            )
 
 
 @st.cache_resource(show_spinner=False)
