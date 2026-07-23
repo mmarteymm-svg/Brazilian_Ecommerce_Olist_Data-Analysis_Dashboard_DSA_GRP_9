@@ -438,10 +438,10 @@ if "error" in model:
 else:
     model_summary = (
         f"On delivery: **{model['late_rate']:.1%}** of orders arrive late. A plain accuracy-optimized model "
-        f"looks good on paper ({model['baseline_accuracy']:.1%} accuracy) but catches essentially no late "
+        f"looks good on paper ({model['baseline_accuracy']:.1%} accuracy) but catches essentially zero late "
         f"orders. The class-balanced model catches **{model['recall_late']:.1%}** of them instead, at the "
         "cost of some accuracy — the right trade-off for a checkout-time risk flag, since missing a late "
-        "order is costlier than a false alarm."
+        "order is costlier than a false alarm based on the insights from the order reviews"
     )
 
 st.markdown(f"""
