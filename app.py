@@ -144,17 +144,42 @@ def compute_marts(_con, fingerprint):
     con = _con
 
     monthly_revenue = con.sql("""
-        SELECT date_trunc('month', o.order_purchase_timestamp) AS month,
-               SUM(oi.price + oi.freight_value) AS revenue
-        FROM orders o JOIN order_items oi USING (order_id)
-        WHERE o.order_purchase_timestamp IS NOT NULL
-        GROUP BY month ORDER BY month
+        WITH monthly AS (
+            SELECT date_trunc('month', o.order_purchase_timestamp) AS month,
+                   SUM(oi.price + oi.freight_value) AS revenue
+            FROM orders o JOIN order_items oi USING (order_id)
+            WHERE o.order_purchase_timestamp IS NOT NULL
+            GROUP BY month
+        )
+        SELECT
+            month, revenue,
+            SUM(revenue) OVER (ORDER BY month) AS running_total,
+            ROUND(
+                100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+                / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 2
+            ) AS mom_growth_pct
+        FROM monthly
+        ORDER BY month
     """).df()
 
     category_revenue = con.sql("""
         SELECT p.product_category_name, SUM(oi.price + oi.freight_value) AS revenue
         FROM order_items oi JOIN products p ON oi.product_id = p.product_id
         GROUP BY p.product_category_name ORDER BY revenue DESC
+    """).df()
+
+    top_sellers = con.sql("""
+        SELECT
+            p.product_category_name,
+            oi.seller_id,
+            SUM(oi.price + oi.freight_value) AS total_revenue,
+            RANK() OVER (
+                PARTITION BY p.product_category_name ORDER BY SUM(oi.price + oi.freight_value) DESC
+            ) AS seller_rank
+        FROM order_items oi
+        JOIN products p ON oi.product_id = p.product_id
+        GROUP BY p.product_category_name, oi.seller_id
+        ORDER BY p.product_category_name, seller_rank
     """).df()
 
     quartile_summary = con.sql("""
@@ -208,7 +233,7 @@ def compute_marts(_con, fingerprint):
         FROM orders
     """).df().iloc[0].to_dict()
 
-    return monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data, diagnostics
+    return monthly_revenue, category_revenue, top_sellers, quartile_summary, review_distribution, ml_data, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +324,7 @@ con = load_data(tuple(sorted(table_paths.items())))
 
 table_names = con.sql("SHOW TABLES").df()["name"].tolist()
 fingerprint = tuple(sorted(table_paths.items()))
-monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data, diagnostics = compute_marts(con, fingerprint)
+monthly_revenue, category_revenue, top_sellers, quartile_summary, review_distribution, ml_data, diagnostics = compute_marts(con, fingerprint)
 model = train_model(ml_data, fingerprint)
 
 # --- Data health check (visible if something looks off) ---
@@ -333,7 +358,15 @@ if monthly_revenue.empty:
 else:
     mr = monthly_revenue.dropna(subset=["month"]).copy()
     mr["month"] = pd.to_datetime(mr["month"]).dt.strftime("%Y-%m")
-    st.bar_chart(mr.set_index("month")["revenue"])
+    st.bar_chart(mr.set_index("month")["revenue"].rename("Monthly Revenue (R$)"))
+
+    rev_col1, rev_col2 = st.columns(2)
+    with rev_col1:
+        st.caption("Cumulative Revenue Growth")
+        st.line_chart(mr.set_index("month")["running_total"].rename("Running Total (R$)"))
+    with rev_col2:
+        st.caption("Month-over-Month Growth Rate")
+        st.bar_chart(mr.set_index("month")["mom_growth_pct"].rename("MoM Growth (%)"))
 
 col_a, col_b = st.columns(2)
 
@@ -346,8 +379,18 @@ with col_b:
     st.subheader("👥 Customer Spend by Tier")
     tier_avg = quartile_summary.groupby("quartile")["total_spent"].mean()
     tier_avg.index = "Tier " + tier_avg.index.astype(str)
-    st.bar_chart(tier_avg)
-    st.caption("Tier 1 = top 25% of customers by total spend.")
+    st.bar_chart(tier_avg.rename("Average Spend (R$)"))
+    st.caption("Tier 1 = top 25% of customers by total spend. Bars show average spend per customer within each tier.")
+
+st.subheader("🏆 Top Sellers by Category")
+cats = sorted(top_sellers["product_category_name"].dropna().unique())
+chosen_cat = st.selectbox("Category", cats)
+top_sellers_display = (
+    top_sellers[top_sellers["product_category_name"] == chosen_cat]
+    .head(10)[["seller_rank", "seller_id", "total_revenue"]]
+    .rename(columns={"seller_rank": "Rank", "seller_id": "Seller ID", "total_revenue": "Revenue (R$)"})
+)
+st.dataframe(top_sellers_display, width="stretch", hide_index=True)
 
 st.subheader("🚚 Review Score by Delivery Status")
 if review_distribution.empty:
