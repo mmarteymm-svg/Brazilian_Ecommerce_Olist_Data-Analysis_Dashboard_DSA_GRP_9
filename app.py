@@ -146,18 +146,27 @@ def compute_marts(_con, fingerprint):
     monthly_revenue = con.sql("""
         WITH monthly AS (
             SELECT date_trunc('month', o.order_purchase_timestamp) AS month,
-                   SUM(oi.price + oi.freight_value) AS revenue
+                   SUM(oi.price + oi.freight_value) AS revenue,
+                   COUNT(DISTINCT o.order_id) AS order_count
             FROM orders o JOIN order_items oi USING (order_id)
             WHERE o.order_purchase_timestamp IS NOT NULL
             GROUP BY month
         )
         SELECT
-            month, revenue,
+            month, revenue, order_count,
             SUM(revenue) OVER (ORDER BY month) AS running_total,
-            ROUND(
-                100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
-                / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 2
-            ) AS mom_growth_pct
+            CASE
+                -- Olist's first few months (2016) have only a handful of pilot
+                -- orders; a % change off a near-zero base produces a spike of
+                -- tens of thousands of percent that swamps every other bar.
+                -- Only compute growth % once both months have real volume.
+                WHEN order_count >= 10 AND LAG(order_count) OVER (ORDER BY month) >= 10
+                THEN ROUND(
+                    100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+                    / NULLIF(LAG(revenue) OVER (ORDER BY month), 0), 2
+                )
+                ELSE NULL
+            END AS mom_growth_pct
         FROM monthly
         ORDER BY month
     """).df()
@@ -385,12 +394,9 @@ with col_b:
 st.subheader("🏆 Top Sellers by Category")
 cats = sorted(top_sellers["product_category_name"].dropna().unique())
 chosen_cat = st.selectbox("Category", cats)
-top_sellers_display = (
-    top_sellers[top_sellers["product_category_name"] == chosen_cat]
-    .head(10)[["seller_rank", "seller_id", "total_revenue"]]
-    .rename(columns={"seller_rank": "Rank", "seller_id": "Seller ID", "total_revenue": "Revenue (R$)"})
-)
-st.dataframe(top_sellers_display, width="stretch", hide_index=True)
+top_sellers_display = top_sellers[top_sellers["product_category_name"] == chosen_cat].head(10).copy()
+top_sellers_display["label"] = "#" + top_sellers_display["seller_rank"].astype(str) + " " + top_sellers_display["seller_id"].str[:8]
+st.bar_chart(top_sellers_display.set_index("label")["total_revenue"].rename("Revenue (R$)"))
 
 st.subheader("🚚 Review Score by Delivery Status")
 if review_distribution.empty:
