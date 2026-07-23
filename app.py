@@ -1,16 +1,18 @@
 """
-Olist E-Commerce Analytics — Streamlit App (simplified)
+Olist E-Commerce Analytics — Streamlit App
 Built from the DSA Group 9 capstone notebook.
+
+Data can come from either:
+  1. A bundled `data/` folder next to this file (auto-loaded, no upload needed), or
+  2. CSVs uploaded via the sidebar (overrides bundled data for that session).
 
 Run:
     pip install -r requirements.txt
     streamlit run app.py
-
-Then upload the Olist CSVs from kaggle.com/datasets/olistbr/brazilian-ecommerce
 """
 
-import re
 import os
+import re
 import tempfile
 
 import duckdb
@@ -29,35 +31,21 @@ REQUIRED_TABLES = [
     "order_reviews", "products", "sellers", "product_category_name_translation",
 ]
 
-# Bundled dataset location: put the 8 Olist CSVs (everything except
-# olist_geolocation_dataset.csv, which the app doesn't use) in a `data/`
-# folder next to this script and they'll load automatically — no upload
-# needed. The sidebar uploader still works and overrides these for the
-# session if the user uploads files there instead.
+# Known date/timestamp columns per table. Parsed explicitly via pandas
+# (rather than relying on DuckDB's auto type-detection, which can silently
+# leave a column as VARCHAR/NULL on real-world data with blank values or
+# large row counts) so every downstream date comparison is reliable.
+DATE_COLUMNS = {
+    "orders": [
+        "order_purchase_timestamp", "order_approved_at",
+        "order_delivered_carrier_date", "order_delivered_customer_date",
+        "order_estimated_delivery_date",
+    ],
+    "order_reviews": ["review_creation_date", "review_answer_timestamp"],
+    "order_items": ["shipping_limit_date"],
+}
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-BUNDLED_FILENAMES = [
-    "olist_customers_dataset.csv",
-    "olist_orders_dataset.csv",
-    "olist_order_items_dataset.csv",
-    "olist_order_payments_dataset.csv",
-    "olist_order_reviews_dataset.csv",
-    "olist_products_dataset.csv",
-    "olist_sellers_dataset.csv",
-    "product_category_name_translation.csv",
-]
-
-
-def get_bundled_file_records():
-    """Read whichever bundled CSVs exist in DATA_DIR. Returns a tuple of
-    (filename, bytes), matching the shape st.file_uploader results are
-    converted to, so both paths can feed the same load_data()."""
-    records = []
-    for filename in BUNDLED_FILENAMES:
-        path = os.path.join(DATA_DIR, filename)
-        if os.path.isfile(path):
-            with open(path, "rb") as f:
-                records.append((filename, f.read()))
-    return tuple(records)
 
 
 # ---------------------------------------------------------------------------
@@ -69,31 +57,57 @@ def table_name_from_filename(filename: str) -> str:
     return re.sub(r"olist_|_dataset", "", base)
 
 
-@st.cache_resource(show_spinner=False)
-def load_data(file_records):
-    """file_records: tuple of (filename, bytes). Writes to disk, loads into DuckDB,
-    and force-casts any date/timestamp-named column so downstream SQL never hits a VARCHAR."""
-    tmp_dir = tempfile.mkdtemp(prefix="olist_")
-    con = duckdb.connect(database=":memory:")
+def find_bundled_csvs() -> dict:
+    """Return {table_name: path} for CSVs found in the bundled data/ folder."""
+    if not os.path.isdir(DATA_DIR):
+        return {}
+    paths = {}
+    for fname in os.listdir(DATA_DIR):
+        if fname.lower().endswith(".csv"):
+            paths[table_name_from_filename(fname)] = os.path.join(DATA_DIR, fname)
+    return paths
 
+
+def load_table(con: duckdb.DuckDBPyConnection, name: str, path: str) -> None:
+    """Load one CSV into DuckDB as table `name`. Uses pandas with explicit
+    parse_dates for tables with known date columns (reliable), and DuckDB's
+    read_csv_auto for everything else (fast, fine for non-date columns)."""
+    date_cols = DATE_COLUMNS.get(name, [])
+    if date_cols:
+        # Only parse columns that actually exist in this file, in case of
+        # a slightly different export/schema version.
+        header = pd.read_csv(path, nrows=0).columns.tolist()
+        parse_dates = [c for c in date_cols if c in header]
+        df = pd.read_csv(path, parse_dates=parse_dates) if parse_dates else pd.read_csv(path)
+        con.register("_stage", df)
+        con.execute(f'CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM _stage')
+        con.unregister("_stage")
+    else:
+        con.execute(f"CREATE OR REPLACE TABLE \"{name}\" AS SELECT * FROM read_csv_auto('{path}')")
+
+
+@st.cache_resource(show_spinner=False)
+def load_data(table_paths: tuple) -> duckdb.DuckDBPyConnection:
+    """table_paths: tuple of (table_name, path) pairs — hashable, so this is cached."""
+    con = duckdb.connect(database=":memory:")
+    for name, path in table_paths:
+        load_table(con, name, path)
+    return con
+
+
+@st.cache_resource(show_spinner=False)
+def stage_uploaded_csvs(file_records: tuple) -> dict:
+    """file_records: tuple of (filename, bytes). Writes each upload to a temp
+    dir on disk and returns {table_name: path}."""
+    tmp_dir = tempfile.mkdtemp(prefix="olist_")
+    paths = {}
     for filename, raw_bytes in file_records:
         name = table_name_from_filename(filename)
         path = os.path.join(tmp_dir, filename)
         with open(path, "wb") as f:
             f.write(raw_bytes)
-        con.execute(f"CREATE OR REPLACE TABLE \"{name}\" AS SELECT * FROM read_csv_auto('{path}')")
-
-        cols = con.execute(f'DESCRIBE "{name}"').df()
-        for _, row in cols.iterrows():
-            col, dtype = row["column_name"], row["column_type"]
-            if ("date" in col.lower() or "timestamp" in col.lower()) and dtype not in (
-                "TIMESTAMP", "DATE", "TIMESTAMP WITH TIME ZONE"
-            ):
-                con.execute(
-                    f'ALTER TABLE "{name}" ALTER COLUMN "{col}" '
-                    f'TYPE TIMESTAMP USING TRY_CAST("{col}" AS TIMESTAMP)'
-                )
-    return con
+        paths[name] = path
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +122,7 @@ def compute_marts(_con, fingerprint):
         SELECT date_trunc('month', o.order_purchase_timestamp) AS month,
                SUM(oi.price + oi.freight_value) AS revenue
         FROM orders o JOIN order_items oi USING (order_id)
+        WHERE o.order_purchase_timestamp IS NOT NULL
         GROUP BY month ORDER BY month
     """).df()
 
@@ -136,6 +151,7 @@ def compute_marts(_con, fingerprint):
             r.review_score, COUNT(*) AS reviews
         FROM orders o JOIN order_reviews r USING (order_id)
         WHERE o.order_delivered_customer_date IS NOT NULL
+          AND o.order_estimated_delivery_date IS NOT NULL
         GROUP BY delivery_status, r.review_score
         ORDER BY delivery_status, r.review_score
     """).df()
@@ -153,9 +169,21 @@ def compute_marts(_con, fingerprint):
         JOIN products p ON oi.product_id = p.product_id
         JOIN customers c ON o.customer_id = c.customer_id
         WHERE o.order_delivered_customer_date IS NOT NULL
+          AND o.order_estimated_delivery_date IS NOT NULL
     """).df()
 
-    return monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data
+    # Diagnostics: null counts on the date columns that drive the charts/model,
+    # so a data problem is visible instead of just producing an empty chart.
+    diagnostics = con.sql("""
+        SELECT
+            COUNT(*) AS total_orders,
+            COUNT(order_purchase_timestamp) AS non_null_purchase_ts,
+            COUNT(order_delivered_customer_date) AS non_null_delivered,
+            COUNT(order_estimated_delivery_date) AS non_null_estimated
+        FROM orders
+    """).df().iloc[0].to_dict()
+
+    return monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +202,6 @@ def train_model(ml_data: pd.DataFrame, fingerprint):
     if len(y) < 10:
         return {"error": f"Only {len(y)} delivered orders with complete data were found — too few to train a reliable model."}
 
-    # Stratified split needs at least 2 members per class; fall back to a plain
-    # split if the minority class is too small for that.
     can_stratify = class_counts.min() >= 2
     strat = y if can_stratify else None
 
@@ -207,45 +233,59 @@ def train_model(ml_data: pd.DataFrame, fingerprint):
 st.title("🛒 Olist E-Commerce Analytics")
 st.caption("Revenue, customers, delivery, and a late-delivery risk model — DSA Group 9 capstone.")
 
-bundled_records = get_bundled_file_records()
+bundled_paths = find_bundled_csvs()
+bundled_ready = all(t in bundled_paths for t in REQUIRED_TABLES)
 
 with st.sidebar:
     st.header("Data")
-    if bundled_records:
-        st.success(f"✅ {len(bundled_records)}/{len(BUNDLED_FILENAMES)} bundled CSVs found in `data/`")
+    if bundled_ready:
+        st.success("Using bundled Olist dataset ✅")
+        st.caption(
+            "Optional: upload CSVs below to override the bundled data for this "
+            "session (e.g. to test a refreshed export). Source: "
+            "kaggle.com/datasets/olistbr/brazilian-ecommerce"
+        )
     else:
-        st.warning("No bundled CSVs found in `data/`")
-    st.caption(
-        "Optional: upload CSVs below to override the bundled data for this "
-        "session (e.g. to test a refreshed export). "
-        "Source: kaggle.com/datasets/olistbr/brazilian-ecommerce"
+        st.warning(f"No bundled CSVs found in `data/`")
+        st.caption("Upload the Olist CSVs (kaggle.com/datasets/olistbr/brazilian-ecommerce)")
+
+    uploaded = st.file_uploader(
+        "Select CSVs to override bundled data" if bundled_ready else "Select all 8 CSVs at once",
+        type="csv", accept_multiple_files=True,
     )
-    uploaded = st.file_uploader("Select CSVs to override bundled data", type="csv", accept_multiple_files=True)
 
 if uploaded:
     file_records = tuple((f.name, f.getvalue()) for f in uploaded)
+    upload_paths = stage_uploaded_csvs(file_records)
+    table_paths = {**bundled_paths, **upload_paths}  # uploads override bundled
     st.caption("📤 Using uploaded files for this session (overriding bundled data).")
-elif bundled_records:
-    file_records = bundled_records
-    st.caption("📁 Using bundled data from the app's `data/` folder.")
+elif bundled_ready:
+    table_paths = bundled_paths
 else:
-    file_records = ()
-
-if not file_records:
-    st.info("👈 No data available yet — upload the Olist CSVs to get started, or add them to the app's `data/` folder.")
+    st.info("👈 Upload the Olist CSVs to get started.")
     st.stop()
 
-con = load_data(file_records)
-
-table_names = con.sql("SHOW TABLES").df()["name"].tolist()
-missing = [t for t in REQUIRED_TABLES if t not in table_names]
+missing = [t for t in REQUIRED_TABLES if t not in table_paths]
 if missing:
     st.error(f"Missing required table(s): {', '.join(missing)}")
     st.stop()
 
-fingerprint = tuple(sorted(table_names))
-monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data = compute_marts(con, fingerprint)
+con = load_data(tuple(sorted(table_paths.items())))
+
+table_names = con.sql("SHOW TABLES").df()["name"].tolist()
+fingerprint = tuple(sorted(table_paths.items()))
+monthly_revenue, category_revenue, quartile_summary, review_distribution, ml_data, diagnostics = compute_marts(con, fingerprint)
 model = train_model(ml_data, fingerprint)
+
+# --- Data health check (visible if something looks off) ---
+pct_missing_est = 1 - diagnostics["non_null_estimated"] / diagnostics["total_orders"]
+pct_missing_delivered = 1 - diagnostics["non_null_delivered"] / diagnostics["total_orders"]
+if pct_missing_est > 0.5 or pct_missing_delivered > 0.9 or monthly_revenue.empty:
+    with st.expander("⚠️ Data health check — click for details", expanded=True):
+        st.write(diagnostics)
+        st.write("`ml_data` rows available for the model:", len(ml_data))
+        if "is_late" in ml_data.columns:
+            st.write("is_late value counts:", ml_data["is_late"].value_counts().to_dict())
 
 # --- KPIs ---
 total_revenue = monthly_revenue["revenue"].sum()
@@ -263,7 +303,12 @@ st.divider()
 
 # --- Dashboard ---
 st.subheader("📈 Monthly Revenue")
-st.bar_chart(monthly_revenue.set_index("month")["revenue"])
+if monthly_revenue.empty:
+    st.info("No monthly revenue data available.")
+else:
+    mr = monthly_revenue.dropna(subset=["month"]).copy()
+    mr["month"] = pd.to_datetime(mr["month"]).dt.strftime("%Y-%m")
+    st.bar_chart(mr.set_index("month")["revenue"])
 
 col_a, col_b = st.columns(2)
 
@@ -280,10 +325,13 @@ with col_b:
     st.caption("Tier 1 = top 25% of customers by total spend.")
 
 st.subheader("🚚 Review Score by Delivery Status")
-pivot = review_distribution.pivot(index="review_score", columns="delivery_status", values="reviews").fillna(0)
-pivot_pct = (pivot.div(pivot.sum(axis=0), axis=1) * 100).round(1)
-st.bar_chart(pivot_pct)
-st.caption("% of reviews at each score, split by on-time vs late delivery.")
+if review_distribution.empty:
+    st.info("No delivery-status review data available.")
+else:
+    pivot = review_distribution.pivot(index="review_score", columns="delivery_status", values="reviews").fillna(0)
+    pivot_pct = (pivot.div(pivot.sum(axis=0), axis=1) * 100).round(1)
+    st.bar_chart(pivot_pct)
+    st.caption("% of reviews at each score, split by on-time vs late delivery.")
 
 st.divider()
 
@@ -311,7 +359,7 @@ tier1_avg = quartile_summary.groupby('quartile')['total_spent'].mean().iloc[0]
 if "error" in model:
     model_summary = (
         "A late-delivery risk model could not be trained on this data "
-        f"({model['error'].lower()}). Try uploading the full dataset for a complete picture."
+        f"({model['error'].lower()}). See the data health check above for details."
     )
 else:
     model_summary = (
