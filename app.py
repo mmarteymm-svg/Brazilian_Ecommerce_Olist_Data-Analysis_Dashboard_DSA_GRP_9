@@ -451,6 +451,6 @@ Customer spend is concentrated at the top: Tier 1 customers (top 25% by spend) a
 
 {model_summary}
 
-**Recommended actions:** (1) launch a Tier-1 retention offer, (2) deploy the balanced model as a live
-risk flag rather than the accuracy-optimized one, (3) review fulfillment for the highest-revenue categories.
+**Recommended actions:** (1) launch a Tier-1 retention offer- protecting them protects a disproportionate share of revenue, (2) deploy the balanced model as a live
+risk flag rather than the accuracy-optimized one, (3) review fulfillment for the highest-revenue categories to give priority support to the top sellers in similar fashion to the customers.
 """)
