@@ -2,12 +2,12 @@
 
 A Streamlit dashboard built from the DSA Group 9 capstone project analyzing the
 Brazilian Olist e-commerce dataset. Upload the raw Olist CSVs and get an instant
-dashboard covering revenue, customers, delivery performance, and a late-delivery
+dashboard covering revenue, customers, top sellers, delivery performance, and a late-delivery
 risk model.
 
 ## What it does
 
-- **SQL marts** — DuckDB queries compute monthly revenue, category revenue,
+- **SQL marts** — DuckDB queries compute monthly revenue, category revenue, mom growth rate, 
   customer spend quartiles, and review-score distribution by delivery status.
 - **Dashboard** — KPI summary (revenue, orders, late-delivery rate, avg review
   score) plus charts for each mart above.
@@ -35,19 +35,9 @@ Upload the CSVs from the
 Select all files at once in the sidebar uploader. Nothing is stored — everything
 runs in memory for the session.
 
-## Run locally
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Then open the local URL Streamlit prints (usually `http://localhost:8501`) and
-upload the CSVs.
-
 ## Live app
 
-Deployed on Streamlit Community Cloud: *(add your app's URL here once deployed)*
+Deployed on Streamlit Community Cloud: *(https://g9olistdashboard.streamlit.app/)*
 
 ## Tech
 
